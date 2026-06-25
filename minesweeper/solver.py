@@ -1,5 +1,6 @@
 import numpy as np
 
+from minesweeper import probability
 from minesweeper.board import HIDDEN, FLAGGED, Board
 
 _NOT_HIDDEN_OR_FLAG = 99  # sentinel for out-of-bounds neighbours: must not match HIDDEN/FLAGGED
@@ -138,3 +139,35 @@ def solve_deterministic(board: Board, max_passes: int = 1000) -> None:
             continue
         if not subset_step(board):
             return
+
+
+def solve(board: Board, max_passes: int = 1000) -> dict[int, float]:
+    """Full solve: cheap deterministic logic first, then exact CSP enumeration
+    (`probability.compute_probabilities`) to squeeze out every remaining
+    provably-safe/mine tile - that's strictly more powerful than `step`/
+    `subset_step`, just more expensive, which is why it only runs once those
+    two are stuck.
+
+    Returns the mine probability of every tile that's still genuinely
+    ambiguous after all of that (empty dict if the board ends up fully resolved).
+    """
+    for _ in range(max_passes):
+        if board.done:
+            return {}
+
+        if step(board) or subset_step(board):
+            continue
+
+        probabilities = probability.compute_probabilities(board)
+        certain_safe = [tile for tile, p in probabilities.items() if p == 0.0]
+        certain_mine = [tile for tile, p in probabilities.items() if p == 1.0]
+
+        if not certain_safe and not certain_mine:
+            return {tile: p for tile, p in probabilities.items() if 0.0 < p < 1.0}
+
+        if certain_mine:
+            board.state[certain_mine] = FLAGGED
+        for idx in certain_safe:
+            board.open_tile(int(idx))
+
+    return {}

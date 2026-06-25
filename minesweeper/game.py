@@ -4,7 +4,7 @@ from torch.utils.data import TensorDataset
 
 from minesweeper.board import Board
 from minesweeper.network import TileClassifier
-from minesweeper.solver import solve_deterministic
+from minesweeper.solver import solve
 
 VIEW_SIZE = 25
 
@@ -20,10 +20,11 @@ def new_game(rows: int, cols: int, n_mines: int, rng: np.random.Generator) -> Bo
 def generate_dataset(
     rows: int, cols: int, n_mines: int, num_samples: int, seed: int | None = None
 ) -> TensorDataset:
-    """Play random games out to the point logic gets stuck, and label every
-    remaining border tile (mine=0, safe=1). These ambiguous tiles are exactly
-    what the model needs to learn - the deterministic solver already handles
-    everything else, both here and at inference time.
+    """Play random games out to the point the solver - cheap logic plus exact
+    CSP enumeration - can prove nothing more, and label every tile it's left
+    genuinely undecided on (mine=0, safe=1). These are the only tiles where
+    no amount of reasoning helps, which is exactly what the model has a
+    chance of adding value on, both here and at inference time.
     """
     rng = np.random.default_rng(seed)
     view_chunks: list[np.ndarray] = []
@@ -32,15 +33,15 @@ def generate_dataset(
 
     while collected < num_samples:
         board = new_game(rows, cols, n_mines, rng)
-        solve_deterministic(board)
+        probabilities = solve(board)
 
-        border = board.border_tiles()
-        if border.size == 0:
+        if not probabilities:
             continue
 
-        view_chunks.append(board.views(border))
-        label_chunks.append((~board.is_mine[border]).astype(np.int64))
-        collected += border.size
+        tiles = np.array(list(probabilities.keys()))
+        view_chunks.append(board.views(tiles))
+        label_chunks.append((~board.is_mine[tiles]).astype(np.int64))
+        collected += tiles.size
 
     views = np.concatenate(view_chunks)[:num_samples]
     labels = np.concatenate(label_chunks)[:num_samples]
@@ -57,37 +58,43 @@ def play_episode(
     model: TileClassifier | None = None,
     rng: np.random.Generator | None = None,
 ) -> bool:
-    """Play one game to completion. Logic solves what it can; remaining
-    border tiles are picked by the model (most confident prediction first),
-    or randomly if no model is given. Returns True on a win.
+    """Play one game to completion. The solver (logic + exact CSP enumeration)
+    resolves everything it provably can; whatever's left is genuinely
+    ambiguous. Without a model, the best play there is just the
+    lowest-probability tile the solver already computed - no model can beat
+    that on tiles the solver has already proven are irreducibly uncertain.
+    With a model, defer to its most confident prediction instead. Returns
+    True on a win.
     """
     rng = rng if rng is not None else np.random.default_rng()
     board = new_game(rows, cols, n_mines, rng)
 
     while not board.done:
-        solve_deterministic(board)
+        probabilities = solve(board)
         if board.done:
             break
 
-        border = board.border_tiles()
-        if border.size == 0:
+        if not probabilities:
             hidden = board.hidden_tiles()
             if hidden.size == 0:
                 break
             board.open_tile(int(rng.choice(hidden)))
             continue
 
+        tiles = np.array(list(probabilities.keys()))
+
         if model is None:
-            board.open_tile(int(rng.choice(border)))
+            safest = min(probabilities, key=probabilities.get)
+            board.open_tile(int(safest))
             continue
 
-        views = board.views(border)
+        views = board.views(tiles)
         with torch.no_grad():
             logits = model(torch.tensor(views, dtype=torch.float32))
             probs = torch.softmax(logits, dim=1).numpy()
 
         tile_local, cls = divmod(int(np.argmax(probs)), 2)
-        target = int(border[tile_local])
+        target = int(tiles[tile_local])
         if cls == 1:
             board.open_tile(target)
         else:
